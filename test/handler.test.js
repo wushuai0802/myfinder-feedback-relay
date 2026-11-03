@@ -302,8 +302,8 @@ test("GitHub URLs, headers, methods, label and UTC searches match the configured
     return url.searchParams.get("q");
   });
   assert.deepEqual(queries, [
-    "repo:" + repo + " label:in-app-feedback created:>=2026-11-03T07:30:00.000Z",
-    "repo:" + repo + " label:in-app-feedback created:>=2026-11-02T08:30:00.000Z",
+    "repo:" + repo + " is:issue label:in-app-feedback created:>=2026-11-03T07:30:00.000Z",
+    "repo:" + repo + " is:issue label:in-app-feedback created:>=2026-11-02T08:30:00.000Z",
   ]);
   const issue = github.calls[2];
   assert.equal(issue.url, "https://api.github.com/repos/" + repo + "/issues");
@@ -320,6 +320,26 @@ test("GitHub URLs, headers, methods, label and UTC searches match the configured
     assert.equal(call.signal.aborted, false);
     assert.ok(!JSON.stringify({ url: call.url, body: call.body, headers: call.headers }).includes(ADDRESS));
   }
+});
+
+test("both global searches include is:issue for fine-grained tokens", async () => {
+  const github = fakeGithub();
+  const queries = [];
+  const { handler, logs } = setup({ fetch: (url, init) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/search/issues") {
+      const qualifiers = parsed.searchParams.get("q").split(/\s+/);
+      queries.push(qualifiers);
+      if (!qualifiers.includes("is:issue")) return new Response(null, { status: 422 });
+    }
+    return github.fetch(url, init);
+  } });
+  const response = await handler(feedback(), ADDRESS);
+  assert.equal(queries.length, 2);
+  for (const qualifiers of queries) assert.ok(qualifiers.includes("is:issue"));
+  assert.equal(response.status, 201);
+  assert.equal(issueCalls(github).length, 1);
+  assert.deepEqual(logs, []);
 });
 
 test("token whitespace is trimmed before every GitHub Authorization header", async () => {

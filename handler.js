@@ -221,7 +221,7 @@ export function createHandler({
 
   async function searchCount(stage, since) {
     const url = new URL("https://api.github.com/search/issues");
-    url.searchParams.set("q", `repo:${repo} label:in-app-feedback created:>=${new Date(since).toISOString()}`);
+    url.searchParams.set("q", `repo:${repo} is:issue label:in-app-feedback created:>=${new Date(since).toISOString()}`);
     url.searchParams.set("per_page", "1");
     const { data, status } = await githubJson(stage, url.href);
     if (!Number.isSafeInteger(data?.total_count) || data.total_count < 0 || data.incomplete_results === true) {

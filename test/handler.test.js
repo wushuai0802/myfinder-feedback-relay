@@ -62,10 +62,20 @@ function fakeGithub({ hour = 0, day = 0, number = 37 } = {}) {
 
 function setup(options = {}) {
   const github = fakeGithub();
+  const logs = [];
   return {
     github,
-    handler: createHandler({ token: TOKEN, fetch: github.fetch, now: () => NOW, ...options }),
+    logs,
+    handler: createHandler({
+      token: TOKEN, fetch: github.fetch, now: () => NOW, log: (...args) => logs.push(args), ...options,
+    }),
   };
+}
+
+function expectLog(logs, stage, status, kind, times = 1) {
+  assert.deepEqual(logs, Array.from({ length: times }, () => [
+    `relay_error stage=${stage} status=${status} kind=${kind}`,
+  ]));
 }
 
 function noCors(response) {
@@ -101,7 +111,7 @@ function captureAddressTable(t, options) {
 }
 
 test("health, unknown paths and unsupported methods work without GitHub or CORS", async () => {
-  const { handler, github } = setup({ token: undefined });
+  const { handler, github, logs } = setup({ token: undefined });
   const health = await handler(new Request("https://relay.invalid/health"));
   assert.equal(health.status, 200);
   assert.deepEqual(await health.json(), { ok: true });
@@ -118,6 +128,7 @@ test("health, unknown paths and unsupported methods work without GitHub or CORS"
   assert.equal(response.headers.get("allow"), "GET");
   await expectError(response, 405, "invalid");
   assert.equal(github.calls.length, 0);
+  assert.deepEqual(logs, []);
 });
 
 test("all categories and legal field boundaries are accepted", async (t) => {
@@ -135,13 +146,14 @@ test("all categories and legal field boundaries are accepted", async (t) => {
   ];
   for (const [index, overrides] of cases.entries()) {
     await t.test("legal case " + index, async () => {
-      const { handler, github } = setup();
+      const { handler, github, logs } = setup();
       const response = await handler(feedback(valid(overrides)), ADDRESS);
       assert.equal(response.status, 201);
       noCors(response);
       const issue = JSON.parse(issueCalls(github)[0].body);
       const names = { device: "设备不识别", battery: "电量或 DPI 不对", ui: "界面或操作", other: "其他" };
       assert.ok(issue.title.startsWith("[程序内反馈] " + names[overrides.category || "device"] + "："));
+      assert.deepEqual(logs, []);
     });
   }
 });
@@ -167,9 +179,10 @@ test("wrong types, missing/extra fields and invalid values never call fetch", as
   }
   for (const [index, payload] of cases.entries()) {
     await t.test("invalid case " + index, async () => {
-      const { handler, github } = setup();
+      const { handler, github, logs } = setup();
       await expectError(await handler(feedback(payload), ADDRESS), 400, "invalid");
       assert.equal(github.calls.length, 0);
+      assert.deepEqual(logs, []);
     });
   }
 });
@@ -199,7 +212,7 @@ test("non-JSON, missing/wrong media types and failed request streams are sanitiz
 });
 
 test("Content-Length rejects oversize bodies before reading, including huge numbers", async () => {
-  const { handler, github } = setup();
+  const { handler, github, logs } = setup();
   for (const length of ["32769", "999999999999999999999999999999999999"]) {
     let reads = 0;
     const stream = new ReadableStream({ pull() { reads++; } }, { highWaterMark: 0 });
@@ -210,12 +223,13 @@ test("Content-Length rejects oversize bodies before reading, including huge numb
     await expectError(await handler(feedback(valid(), { "Content-Length": length }), ADDRESS), 400, "invalid");
   }
   assert.equal(github.calls.length, 0);
+  assert.deepEqual(logs, []);
 });
 
 test("actual byte limit is inclusive and enforced for absent or dishonest Content-Length", async () => {
   const raw = JSON.stringify(valid());
   const exact = raw + " ".repeat(32768 - encoder.encode(raw).byteLength);
-  const { handler, github } = setup();
+  const { handler, github, logs } = setup();
   assert.equal((await handler(rawFeedback(exact, { "Content-Length": "32768" }), ADDRESS)).status, 201);
   await expectError(await handler(rawFeedback(exact + " "), ADDRESS), 413, "too_large");
   await expectError(await handler(rawFeedback(exact + " ", { "Content-Length": "1" }), ADDRESS), 413, "too_large");
@@ -224,6 +238,7 @@ test("actual byte limit is inclusive and enforced for absent or dishonest Conten
   assert.ok(encoder.encode(multibyte).byteLength > 32768);
   await expectError(await handler(rawFeedback(multibyte), ADDRESS), 413, "too_large");
   assert.equal(issueCalls(github).length, 1);
+  assert.deepEqual(logs, []);
 });
 
 test("streamed bodies stop reading and cancel when accumulated bytes exceed the limit", async () => {
@@ -307,6 +322,14 @@ test("GitHub URLs, headers, methods, label and UTC searches match the configured
   }
 });
 
+test("token whitespace is trimmed before every GitHub Authorization header", async () => {
+  const { handler, github, logs } = setup({ token: " \t\r\n" + TOKEN + "\n\t " });
+  assert.equal((await handler(feedback(), ADDRESS)).status, 201);
+  assert.equal(github.calls.length, 3);
+  for (const call of github.calls) assert.equal(call.headers.Authorization, "Bearer " + TOKEN);
+  assert.deepEqual(logs, []);
+});
+
 test("successful response uses the default repo and only a safe issue number plus generated URL", async () => {
   const { handler } = setup();
   const response = await handler(feedback(), ADDRESS);
@@ -316,7 +339,7 @@ test("successful response uses the default repo and only a safe issue number plu
 
 test("per-address quota rejects the fourth success and recovers exactly one hour later", async () => {
   let at = NOW;
-  const { handler, github } = setup({ now: () => at });
+  const { handler, github, logs } = setup({ now: () => at });
   for (let n = 0; n < 3; n++) assert.equal((await handler(feedback(), ADDRESS)).status, 201);
   const before = github.calls.length;
   const fourth = await handler(feedback(), ADDRESS);
@@ -330,6 +353,7 @@ test("per-address quota rejects the fourth success and recovers exactly one hour
   await expectError(almost, 429, "rate_limited");
   at++;
   assert.equal((await handler(feedback(), ADDRESS)).status, 201);
+  assert.deepEqual(logs, []);
 });
 
 test("the address window slides instead of resetting all successes at once", async () => {
@@ -430,7 +454,7 @@ test("both global thresholds are enforced before creating an issue", async (t) =
   for (const [hour, day, status, retry] of [[9, 39, 201], [10, 10, 429, "3600"], [11, 39, 429, "3600"], [0, 40, 429, "86400"], [9, 41, 429, "86400"]]) {
     await t.test("counts " + hour + "/" + day, async () => {
       const github = fakeGithub({ hour, day });
-      const handler = createHandler({ token: TOKEN, fetch: github.fetch, now: () => NOW });
+      const { handler, logs } = setup({ fetch: github.fetch });
       const response = await handler(feedback(), ADDRESS);
       if (status === 429) {
         assert.equal(response.headers.get("retry-after"), retry);
@@ -438,33 +462,36 @@ test("both global thresholds are enforced before creating an issue", async (t) =
         assert.equal(issueCalls(github).length, 0);
       } else assert.equal(response.status, status);
       assert.equal(github.calls.filter((call) => call.method === "GET").length, 2);
+      assert.deepEqual(logs, []);
     });
   }
 });
 
 test("search failures and malformed/incomplete search responses fail closed", async (t) => {
   const badSearches = [
-    () => { throw new Error(TOKEN + ADDRESS); },
-    () => new Response(TOKEN, { status: 403 }),
-    () => new Response("not JSON"),
-    () => Response.json({}),
-    () => Response.json({ total_count: -1 }),
-    () => Response.json({ total_count: "0" }),
-    () => Response.json({ total_count: 0.5 }),
-    () => Response.json({ total_count: 0, incomplete_results: true }),
+    [() => { throw new Error(TOKEN + ADDRESS); }, 0, "network"],
+    [() => new Response(TOKEN, { status: 401 }), 401, "http"],
+    [() => new Response(TOKEN, { status: 403 }), 403, "http"],
+    [() => new Response("not JSON"), 200, "bad_body"],
+    [() => Response.json({}), 200, "bad_body"],
+    [() => Response.json({ total_count: -1 }), 200, "bad_body"],
+    [() => Response.json({ total_count: "0" }), 200, "bad_body"],
+    [() => Response.json({ total_count: 0.5 }), 200, "bad_body"],
+    [() => Response.json({ total_count: 0, incomplete_results: true }), 200, "bad_body"],
   ];
-  for (const [index, badSearch] of badSearches.entries()) {
+  for (const [index, [badSearch, status, kind]] of badSearches.entries()) {
     for (const failingSearch of [0, 1]) {
       await t.test("failure " + index + " in search " + failingSearch, async () => {
         let searches = 0;
         let posts = 0;
-        const { handler } = setup({ fetch: async (_url, init) => {
+        const { handler, logs } = setup({ fetch: async (_url, init) => {
           if (init.method === "POST") { posts++; return Response.json({ number: 1 }); }
           return searches++ === failingSearch ? badSearch() : Response.json({ total_count: 0 });
         } });
         await expectError(await handler(feedback(), ADDRESS), 502, "unavailable");
         assert.equal(searches, 2);
         assert.equal(posts, 0);
+        expectLog(logs, failingSearch === 0 ? "search_hour" : "search_day", status, kind);
       });
     }
   }
@@ -472,25 +499,28 @@ test("search failures and malformed/incomplete search responses fail closed", as
 
 test("failed issue creation and unsafe numbers are sanitized and do not spend quota", async (t) => {
   const failures = [
-    () => { throw new Error(TOKEN + ADDRESS + valid().description); },
-    () => new Response(TOKEN, { status: 401 }),
-    () => new Response(TOKEN, { status: 500 }),
-    () => new Response("not JSON"),
+    [() => { throw new Error(TOKEN + ADDRESS + valid().description); }, 0, "network"],
+    [() => new Response(TOKEN, { status: 401 }), 401, "http"],
+    [() => new Response(TOKEN, { status: 403 }), 403, "http"],
+    [() => new Response(TOKEN, { status: 500 }), 500, "http"],
+    [() => new Response("not JSON", { status: 201 }), 201, "bad_body"],
     ...[null, {}, { number: "1" }, { number: 0 }, { number: -1 }, { number: 1.5 }, { number: Number.MAX_SAFE_INTEGER + 1 }]
-      .map((body) => () => Response.json(body)),
+      .map((body) => [() => Response.json(body, { status: 201 }), 201, "bad_body"]),
   ];
-  for (const [index, fail] of failures.entries()) {
+  for (const [index, [fail, status, kind]] of failures.entries()) {
     await t.test("issue failure " + index, async () => {
       let failing = true;
       const github = fakeGithub();
-      const { handler } = setup({ fetch: (url, init) => {
+      const { handler, logs } = setup({ fetch: (url, init) => {
         if (failing && init.method === "POST") return fail();
         return github.fetch(url, init);
       } });
       for (let n = 0; n < 4; n++) await expectError(await handler(feedback(), ADDRESS), 502, "unavailable");
+      expectLog(logs, "create", status, kind, 4);
       failing = false;
       for (let n = 0; n < 3; n++) assert.equal((await handler(feedback(), ADDRESS)).status, 201);
       await expectError(await handler(feedback(), ADDRESS), 429, "rate_limited");
+      expectLog(logs, "create", status, kind, 4);
     });
   }
 });
@@ -502,7 +532,7 @@ test("searches time out at 10 seconds, abort both signals and release address re
   const started = new Promise((resolve) => { ready = resolve; });
   const signals = [];
   const normal = fakeGithub();
-  const { handler } = setup({ fetch: (url, init) => {
+  const { handler, logs } = setup({ fetch: (url, init) => {
     if (!stalled) return normal.fetch(url, init);
     signals.push(init.signal);
     if (signals.length === 2) ready();
@@ -516,11 +546,13 @@ test("searches time out at 10 seconds, abort both signals and release address re
   t.mock.timers.tick(1);
   await expectError(await pending, 502, "unavailable");
   assert.ok(signals.every((signal) => signal.aborted));
+  expectLog(logs, "search_hour", 0, "timeout");
   stalled = false;
   for (let n = 0; n < 3; n++) assert.equal((await handler(feedback(), ADDRESS)).status, 201);
   t.mock.timers.tick(10000);
   assert.ok(normal.calls.every((call) => !call.signal.aborted));
   await expectError(await handler(feedback(), ADDRESS), 429, "rate_limited");
+  expectLog(logs, "search_hour", 0, "timeout");
 });
 
 test("issue creation and stalled response bodies share the 10 second abort deadline", async (t) => {
@@ -531,11 +563,14 @@ test("issue creation and stalled response bodies share the 10 second abort deadl
       const started = new Promise((resolve) => { ready = resolve; });
       let signal;
       const github = fakeGithub();
-      const { handler } = setup({ fetch: (url, init) => {
+      const { handler, logs } = setup({ fetch: (url, init) => {
         if (init.method !== "POST") return github.fetch(url, init);
         signal = init.signal;
+        if (stallBody) return { ok: true, status: 201, json: () => {
+          ready();
+          return new Promise(() => {});
+        } };
         ready();
-        if (stallBody) return { ok: true, json: () => new Promise(() => {}) };
         return new Promise((_, reject) => signal.addEventListener("abort", () => {
           reject(new Error(TOKEN + ADDRESS + valid().description));
         }, { once: true }));
@@ -547,36 +582,84 @@ test("issue creation and stalled response bodies share the 10 second abort deadl
       t.mock.timers.tick(1);
       await expectError(await pending, 502, "unavailable");
       assert.equal(signal.aborted, true);
+      expectLog(logs, "create", stallBody ? 201 : 0, "timeout");
     });
   }
 });
 
 test("missing token and disabled mode return 503 without network work", async () => {
-  for (const options of [{ token: undefined }, { token: null }, { token: "" }, { token: "  " }, { disabled: true }]) {
-    const { handler, github } = setup(options);
+  for (const options of [{ token: undefined }, { token: null }, { token: "" }, { token: " \t\r\n " }, { disabled: true }]) {
+    const { handler, github, logs } = setup(options);
     await expectError(await handler(feedback(), ADDRESS), 503, "disabled");
     assert.equal(github.calls.length, 0);
-    assert.equal((await handler(new Request("https://relay.invalid/health"))).status, 200);
+    const health = await handler(new Request("https://relay.invalid/health"));
+    assert.equal(health.status, 200);
+    assert.equal(await health.text(), '{"ok":true}');
+    assert.deepEqual(logs, []);
   }
 });
 
-test("errors never escape or log the token, body or address", async (t) => {
-  const logged = [];
-  for (const name of ["log", "info", "warn", "error", "debug"]) {
-    t.mock.method(console, name, (...args) => logged.push(args));
+test("default console.error logs only one safe line and never logs private data", async (t) => {
+  const secrets = [TOKEN, ADDRESS, valid().description, "private-diagnostics", "private-header", "private-github-body"];
+  const privateText = secrets.join("\n");
+  const cases = [
+    {
+      name: "network exception", stage: "search_hour", status: 0, kind: "network",
+      options: { fetch: () => { throw new Error(privateText); } },
+    },
+    {
+      name: "GitHub error body", stage: "search_hour", status: 401, kind: "http",
+      options: { fetch: () => new Response(privateText, { status: 401 }) },
+    },
+    {
+      name: "malformed GitHub JSON", stage: "create", status: 201, kind: "bad_body",
+      options: { fetch: (_url, init) => init.method === "POST"
+        ? new Response(privateText, { status: 201 }) : Response.json({ total_count: 0 }) },
+    },
+    {
+      name: "invalid GitHub issue body", stage: "create", status: 201, kind: "bad_body",
+      options: { fetch: (_url, init) => init.method === "POST"
+        ? Response.json({ number: privateText }, { status: 201 }) : Response.json({ total_count: 0 }) },
+    },
+    {
+      name: "unexpected exception", stage: "unexpected", status: 0, kind: "unexpected",
+      options: { now: () => { throw new Error(privateText); } },
+    },
+    {
+      name: "untrusted error fields", stage: "unexpected", status: 0, kind: "unexpected",
+      options: { now: () => { throw { stage: privateText, status: privateText, kind: privateText }; } },
+    },
+  ];
+  for (const { name, options, stage, status, kind } of cases) {
+    await t.test(name, async (t) => {
+      const logged = [];
+      for (const method of ["log", "info", "warn", "error", "debug"]) {
+        t.mock.method(console, method, (...args) => logged.push([method, ...args]));
+      }
+      const github = fakeGithub();
+      const handler = createHandler({ token: TOKEN, fetch: github.fetch, now: () => NOW, ...options });
+      const response = await handler(feedback(valid({ diagnostics: secrets[3] }), { "X-Private": secrets[4] }), ADDRESS);
+      const text = await response.text();
+      assert.equal(response.status, 502);
+      assert.equal(text, '{"error":"unavailable"}');
+      assert.deepEqual(logged, [["error", `relay_error stage=${stage} status=${status} kind=${kind}`]]);
+      for (const secret of secrets) {
+        assert.ok(!text.includes(secret));
+        assert.ok(!JSON.stringify([...response.headers]).includes(secret));
+        assert.ok(!JSON.stringify(logged).includes(secret));
+      }
+    });
   }
-  const { handler } = setup({ fetch: () => {
-    throw new Error(TOKEN + ADDRESS + valid().description);
-  } });
-  const response = await handler(feedback(), ADDRESS);
-  const text = await response.text();
-  assert.equal(response.status, 502);
-  assert.equal(text, '{"error":"unavailable"}');
-  for (const secret of [TOKEN, ADDRESS, valid().description]) {
-    assert.ok(!text.includes(secret));
-    assert.ok(!JSON.stringify([...response.headers]).includes(secret));
-  }
-  assert.deepEqual(logged, []);
+});
+
+test("a failing injected logger preserves the 502 response and is called only once", async () => {
+  let calls = 0;
+  const { handler } = setup({
+    fetch: () => { throw new Error(TOKEN); },
+    log: () => { calls++; throw new Error(TOKEN + ADDRESS); },
+  });
+  await expectError(await handler(feedback(), ADDRESS), 502, "unavailable");
+  assert.equal(calls, 1);
 });
 
 test("default global fetch and Date.now remain injectable for portable runtimes", async (t) => {

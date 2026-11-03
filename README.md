@@ -52,6 +52,8 @@
 
 **反馈会公开显示在 GitHub。** 请勿提交密码、令牌、个人身份信息等敏感内容；发送前检查描述和诊断。服务不持久化保存反馈内容，只在处理请求时转发；仅在内存中短期保存地址的 SHA-256 哈希、成功时间和处理中计数用于限流，不保存原始地址，不记录请求内容、地址或令牌。哈希不是完全匿名化；GitHub 和部署平台可能另有自己的数据保留策略。
 
+每次返回 502 时，服务只记录一行 `relay_error stage=create status=403 kind=http` 形式的日志：阶段为 `search_hour`、`search_day`、`create` 或 `unexpected`，状态码为 GitHub HTTP 状态码（未收到则为 `0`），类型为 `timeout`、`network`、`http`、`bad_body` 或 `unexpected`。日志不含请求头、请求体、用户文字、地址、令牌、GitHub 正文或异常消息；其他响应不记录日志。
+
 ## 部署步骤（Deno Deploy）
 
 1. 在 GitHub 的 Settings → Developer settings → Personal access tokens → Fine-grained tokens 创建令牌。资源所有者选择目标仓库所有者，仓库范围选 **Only select repositories**，只选择 **myfinder-device-battery**；仓库权限仅开启 **Issues: Read and write**（**Metadata: Read-only** 会自动附带）。设置到期时间，并把到期提醒写进自己的日历。不要把令牌写进仓库或桌面程序。
@@ -66,4 +68,4 @@
 
 安装 Node 24 后，在项目目录运行 `npm test`（或 `node --test`）。无依赖，测试全部使用假的 fetch，不访问 GitHub。导入 `main.js` 不会在 Node 下启动服务。
 
-`handler.js` 导出 `createHandler({ token, repo, fetch, now, disabled })`，其中 `repo` 默认上述仓库、`fetch` 默认全局 fetch、`now` 默认 `Date.now`。返回的异步函数接收标准 `Request` 和客户端 hostname 字符串（也支持 Deno 的 `{ remoteAddr: { hostname } }`），返回标准 `Response`。其他 Fetch 运行时可自行适配可信地址来源；应保证 Web Crypto、AbortController 和流式 Fetch API 可用。
+`handler.js` 导出 `createHandler({ token, repo, fetch, now, disabled, log })`，其中 `repo` 默认上述仓库、`fetch` 默认全局 fetch、`now` 默认 `Date.now`、`log` 默认 `console.error`。入口读取令牌和 handler 接收令牌时都会去除首尾空白。返回的异步函数接收标准 `Request` 和客户端 hostname 字符串（也支持 Deno 的 `{ remoteAddr: { hostname } }`），返回标准 `Response`。其他 Fetch 运行时可自行适配可信地址来源；应保证 Web Crypto、AbortController 和流式 Fetch API 可用。

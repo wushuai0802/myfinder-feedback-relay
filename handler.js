@@ -12,6 +12,15 @@ const CATEGORIES = Object.freeze({
 });
 const FIELDS = ["schema", "category", "description", "diagnostics", "appVersion"];
 
+class RelayError extends Error {
+  constructor(stage, status, kind) {
+    super();
+    this.stage = stage;
+    this.status = status;
+    this.kind = kind;
+  }
+}
+
 function json(status, body, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,
@@ -140,7 +149,9 @@ export function createHandler({
   fetch: fetchImpl = globalThis.fetch,
   now = Date.now,
   disabled = false,
+  log = console.error,
 } = {}) {
+  if (typeof token === "string") token = token.trim();
   // Only SHA-256 keys, success timestamps and pending counts survive a request.
   const addresses = new Map();
 
@@ -163,32 +174,44 @@ export function createHandler({
     return { entry };
   }
 
-  async function githubJson(url, method = "GET", body) {
+  async function githubJson(stage, url, method = "GET", body) {
     const controller = new AbortController();
     let timeout;
+    let status = 0;
     try {
       return await Promise.race([
         new Promise((_, reject) => {
           timeout = setTimeout(() => {
+            reject(new RelayError(stage, status, "timeout"));
             controller.abort();
-            reject(new Error("unavailable"));
           }, GITHUB_TIMEOUT);
         }),
         (async () => {
-          const response = await fetchImpl(url, {
-            method,
-            headers: {
-              Authorization: `Bearer ${token}`,
-              Accept: "application/vnd.github+json",
-              "X-GitHub-Api-Version": "2022-11-28",
-              "User-Agent": "myfinder-feedback-relay",
-              ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-            },
-            signal: controller.signal,
-            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-          });
-          if (!response.ok) throw new Error("unavailable");
-          return await response.json();
+          let response;
+          try {
+            response = await fetchImpl(url, {
+              method,
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "myfinder-feedback-relay",
+                ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+              },
+              signal: controller.signal,
+              ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            });
+          } catch {
+            throw new RelayError(stage, 0, "network");
+          }
+          status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+            ? response.status : 0;
+          if (!response.ok) throw new RelayError(stage, status, "http");
+          try {
+            return { data: await response.json(), status };
+          } catch {
+            throw new RelayError(stage, status, "bad_body");
+          }
         })(),
       ]);
     } finally {
@@ -196,13 +219,13 @@ export function createHandler({
     }
   }
 
-  async function searchCount(since) {
+  async function searchCount(stage, since) {
     const url = new URL("https://api.github.com/search/issues");
     url.searchParams.set("q", `repo:${repo} label:in-app-feedback created:>=${new Date(since).toISOString()}`);
     url.searchParams.set("per_page", "1");
-    const data = await githubJson(url.href);
+    const { data, status } = await githubJson(stage, url.href);
     if (!Number.isSafeInteger(data?.total_count) || data.total_count < 0 || data.incomplete_results === true) {
-      throw new Error("unavailable");
+      throw new RelayError(stage, status, "bad_body");
     }
     return data.total_count;
   }
@@ -218,7 +241,7 @@ export function createHandler({
 
       const { payload, failure } = await readPayload(request);
       if (failure) return failure;
-      if (disabled || typeof token !== "string" || !token.trim()) return error(503, "disabled");
+      if (disabled || typeof token !== "string" || !token) return error(503, "disabled");
 
       const key = await hashAddress(info);
       const at = now();
@@ -226,21 +249,36 @@ export function createHandler({
       if (!entry) return limited(retry);
       try {
         // Both searches must succeed; an upstream error must never open the gate.
-        const counts = await Promise.allSettled([searchCount(at - HOUR), searchCount(at - DAY)]);
-        if (counts.some((count) => count.status === "rejected")) return error(502, "unavailable");
+        const counts = await Promise.allSettled([
+          searchCount("search_hour", at - HOUR), searchCount("search_day", at - DAY),
+        ]);
+        // Prefer the hour search when both fail, regardless of completion order.
+        const failed = counts.find((count) => count.status === "rejected");
+        if (failed) throw failed.reason;
         if (counts[0].value >= 10) return limited(3600);
         if (counts[1].value >= 40) return limited(86400);
 
-        const issue = await githubJson(`https://api.github.com/repos/${repo}/issues`, "POST", issueContent(payload));
-        if (!Number.isSafeInteger(issue?.number) || issue.number < 1) return error(502, "unavailable");
+        const { data: issue, status } = await githubJson(
+          "create", `https://api.github.com/repos/${repo}/issues`, "POST", issueContent(payload),
+        );
+        if (!Number.isSafeInteger(issue?.number) || issue.number < 1) {
+          throw new RelayError("create", status, "bad_body");
+        }
         entry.successes.push(now());
         return json(201, { number: issue.number, url: `https://github.com/${repo}/issues/${issue.number}` });
       } finally {
         entry.pending--;
         if (!entry.pending && !entry.successes.length) addresses.delete(key);
       }
-    } catch {
-      // Never return or log upstream exceptions, request data, addresses or secrets.
+    } catch (failure) {
+      // Only internally generated metadata is safe; never inspect external errors.
+      const { stage, status, kind } = failure instanceof RelayError
+        ? failure : { stage: "unexpected", status: 0, kind: "unexpected" };
+      try {
+        log(`relay_error stage=${stage} status=${status} kind=${kind}`);
+      } catch {
+        // A failing logger must not change the response or trigger a second log.
+      }
       return error(502, "unavailable");
     }
   };

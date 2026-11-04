@@ -200,6 +200,7 @@ function slidingQuota(limit, window) {
       events = [];
       entries.set(key, events);
     }
+    if (limit <= 0) return { retry: Math.ceil(window / 1000) };
     if (events.length >= limit) return { retry: Math.max(1, Math.ceil((events[0].at + window - at) / 1000)) };
     const event = { at };
     events.push(event);
@@ -402,15 +403,19 @@ export function createHandler({
   log = console.error,
   maintainerId = 50058348,
   triageBotId = 41898282,
+  replyReadBudget = 1200,
 } = {}) {
   if (typeof token === "string") token = token.trim();
   const devicePack = createDevicePackMirror(fetchImpl, now);
   const replyCache = new Map();
   const supplementLocks = new Map();
   const reserveRead = slidingQuota(30, HOUR);
+  const reserveReplyUpstream = slidingQuota(replyReadBudget, HOUR);
+  const reserveSupplementAttempt = slidingQuota(30, HOUR);
   const reserveSupplementAddress = slidingQuota(10, DAY);
   const reserveSupplementGlobal = slidingQuota(20, HOUR);
   let pausedUntil = 0;
+  let latestRateLimit = null;
   // The creation quota stores only address hashes, success timestamps and pending counts.
   const addresses = new Map();
 
@@ -436,6 +441,30 @@ export function createHandler({
   function pauseSeconds() {
     if (!pausedUntil) return 0;
     return Math.max(0, Math.ceil((pausedUntil - now()) / 1000));
+  }
+
+  function observeRateLimit(response) {
+    const remainingHeader = response.headers?.get("x-ratelimit-remaining");
+    if (remainingHeader === null || remainingHeader === undefined) return;
+    const remainingText = remainingHeader.trim();
+    if (!/^\d+$/.test(remainingText)) return;
+    const remaining = Number(remainingText);
+    if (!Number.isSafeInteger(remaining)) return;
+    const resetHeader = response.headers?.get("x-ratelimit-reset");
+    const resetText = resetHeader === null || resetHeader === undefined ? "" : resetHeader.trim();
+    let resetAt = null;
+    if (/^\d+$/.test(resetText)) {
+      const resetSeconds = Number(resetText);
+      if (Number.isSafeInteger(resetSeconds) && resetSeconds <= Number.MAX_SAFE_INTEGER / 1000) {
+        resetAt = resetSeconds * 1000;
+      }
+    }
+    latestRateLimit = { remaining, resetAt };
+  }
+
+  function replyWatermarkActive() {
+    return latestRateLimit !== null && latestRateLimit.remaining < 1000
+      && (latestRateLimit.resetAt === null || latestRateLimit.resetAt > now());
   }
 
   function protectUpstream(response) {
@@ -464,11 +493,16 @@ export function createHandler({
     try { log(`relay_error stage=${stage} status=${status} kind=${kind}`); } catch { /* Logging is best effort. */ }
   }
 
-  async function githubJson(stage, url, method = "GET", body, { cached, allowMissing = false } = {}) {
+  async function githubJson(stage, url, method = "GET", body,
+    { cached, allowMissing = false, replyRead = false } = {}) {
     if (pauseSeconds()) throw new RelayError(stage, 0, "paused");
     const target = new URL(url);
     if (target.origin !== "https://api.github.com" || target.username || target.password || target.hash) {
       throw new RelayError(stage, 0, "redirect");
+    }
+    if (replyRead && replyWatermarkActive()) throw new RelayError(stage, 0, "watermark");
+    if (replyRead && reserveReplyUpstream("global", now()).retry) {
+      throw new RelayError(stage, 0, "read_budget");
     }
     const controller = new AbortController();
     let timeout;
@@ -504,6 +538,7 @@ export function createHandler({
           }
           status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
             ? response.status : 0;
+          observeRateLimit(response);
           if (controller.signal.aborted) {
             if (response.body) void response.body.cancel().catch(() => {});
             throw new RelayError(stage, status, "timeout");
@@ -584,7 +619,8 @@ export function createHandler({
       if (seen.has(url)) throw new RelayError(stage, 0, "bad_body");
       seen.add(url);
       const cached = cachedPages.find((page) => page.url === url);
-      const resource = await githubJson(stage, url, "GET", undefined, { cached });
+      const resource = await githubJson(stage, url, "GET", undefined,
+        { cached, replyRead: stage === "replies_comments" });
       if (!Array.isArray(resource.data) || resource.data.length > 100
           || resource.data.some((comment) => !comment || typeof comment !== "object"
             || (comment.body !== null && typeof comment.body !== "string"))) {
@@ -637,7 +673,7 @@ export function createHandler({
     const cached = replyCache.get(number);
     if (cached && cached.expires > now()) return cached.item;
     const resource = await githubJson("replies_issue", issueURL(number), "GET", undefined,
-      { cached: cached?.resource, allowMissing: true });
+      { cached: cached?.resource, allowMissing: true, replyRead: true });
     let item = { number, status: "unavailable" };
     let pages = [];
     const issue = resource.data;
@@ -655,7 +691,11 @@ export function createHandler({
   }
 
   async function replies(payload, info) {
-    const reservation = reserveRead(await hashAddress(info), now());
+    const key = await hashAddress(info);
+    // Another request can open the breaker while address hashing is pending.
+    const paused = pauseSeconds();
+    if (paused) return error(503, "unavailable", { "Retry-After": String(paused) });
+    const reservation = reserveRead(key, now());
     if (reservation.retry) return limited(reservation.retry);
     const items = [];
     for (const number of payload.numbers) {
@@ -666,6 +706,9 @@ export function createHandler({
   }
 
   async function supplement(payload, info) {
+    const key = await hashAddress(info);
+    const attempt = reserveSupplementAttempt(key, now());
+    if (attempt.retry) return limited(attempt.retry);
     const number = payload.number;
     // Serialize supplements for one issue, including duplicate and quota checks.
     const previous = supplementLocks.get(number) ?? Promise.resolve();
@@ -690,7 +733,7 @@ export function createHandler({
         if (time > at - DAY) recent.set(commentId(comment, "supplement_comments"), time);
       }
       if (recent.size >= 3) return limited(Math.max(1, Math.ceil((Math.min(...recent.values()) + DAY - at) / 1000)));
-      const address = reserveSupplementAddress(await hashAddress(info), now());
+      const address = reserveSupplementAddress(key, now());
       if (address.retry) return limited(address.retry);
       const global = reserveSupplementGlobal("global", now());
       if (global.retry) { address.release(); return limited(global.retry); }
@@ -734,7 +777,11 @@ export function createHandler({
 
       const { payload, failure } = await readPayload(request, path);
       if (failure) return failure;
-      if (path === "/feedback/replies") return await replies(payload, info);
+      if (path === "/feedback/replies") {
+        const paused = pauseSeconds();
+        if (paused) return error(503, "unavailable", { "Retry-After": String(paused) });
+        return await replies(payload, info);
+      }
       if (disabled || typeof token !== "string" || !token) return error(503, "disabled");
       const paused = pauseSeconds();
       if (paused) return error(503, "unavailable", { "Retry-After": String(paused) });

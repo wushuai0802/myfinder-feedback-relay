@@ -442,6 +442,280 @@ test("30 reads per sliding hour counts cache hits and errors, with hashed truste
   assert.equal(failed.calls.length, 30);
 });
 
+test("reply budget counts every comment page and stops a batch while preserving cache hits", async () => {
+  const { handler, calls } = setup({ replyReadBudget: 5, fetch: (url, init, normal) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== `/repos/${REPO}/issues/37/comments`) return normal(url, init);
+    const page = Number(parsed.searchParams.get("page") || 1);
+    return Response.json([comment(page)], { headers: page < 3
+      ? { Link: `<${API}/37/comments?per_page=100&page=${page + 1}>; rel="next"` } : {} });
+  } });
+  assert.equal((await items(handler))[0].status, "ok");
+  assert.equal(calls.length, 4);
+  const batch = await items(handler, [38, 37, 39], "another-address");
+  assert.deepEqual(batch.map(({ number, status }) => [number, status]), [[38, "error"], [37, "ok"], [39, "error"]]);
+  assert.equal(calls.length, 5);
+  assert.equal(calls.at(-1).url, API + "/38");
+});
+
+test("issue and comment revalidation 304s both consume the reply read budget", async () => {
+  let refreshAt = NOW;
+  const refreshed = setup({ now: () => refreshAt, replyReadBudget: 4, fetch: (url, init, normal) => {
+    if (!init.headers["If-None-Match"]) {
+      const response = normal(url, init);
+      response.headers.set("etag", '"v1"');
+      return response;
+    }
+    return new Response(null, { status: 304 });
+  } });
+  const first = await items(refreshed.handler);
+  refreshAt += 10 * 60000;
+  assert.deepEqual(await items(refreshed.handler), first);
+  assert.equal(refreshed.calls.length, 4);
+  assert.ok(refreshed.calls.slice(2).every((call) => call.headers["If-None-Match"] === '"v1"'));
+  assert.equal((await items(refreshed.handler, [38]))[0].status, "error");
+  assert.equal(refreshed.calls.length, 4);
+});
+
+test("reply budget defaults to exactly 1200 upstream calls across addresses", async () => {
+  const { handler, calls } = setup();
+  for (let start = 1; start <= 600; start += 10) {
+    const batch = await items(handler, Array.from({ length: 10 }, (_, i) => start + i), "client-" + start);
+    assert.ok(batch.every((item) => item.status === "ok"));
+  }
+  assert.equal(calls.length, 1200);
+  assert.deepEqual(await items(handler, [601]), [{ number: 601, status: "error" }]);
+  assert.equal((await items(handler, [600]))[0].status, "ok");
+  assert.equal(calls.length, 1200);
+});
+
+test("failed reply calls retain budget reservations and recover one slot at each sliding expiry", async () => {
+  let at = NOW;
+  const { handler, calls } = setup({ replyReadBudget: 2, now: () => at, fetch: () => { throw new Error(TOKEN); } });
+  await items(handler);
+  at += HOUR / 2;
+  await items(handler, [38], "other-address");
+  assert.equal(calls.length, 2);
+  at = NOW + HOUR - 1;
+  await items(handler, [39]);
+  assert.equal(calls.length, 2);
+  at++;
+  await items(handler, [39, 40]);
+  assert.equal(calls.length, 3);
+  at = NOW + HOUR + HOUR / 2;
+  await items(handler, [41, 42]);
+  assert.equal(calls.length, 4);
+});
+
+test("concurrent reply requests reserve budget before fetch and a zero budget permits no calls", async () => {
+  let ready;
+  const started = new Promise((resolve) => { ready = resolve; });
+  const releases = [];
+  const { handler, calls } = setup({ replyReadBudget: 2, fetch: () => new Promise((resolve) => {
+    releases.push(resolve);
+    if (releases.length === 2) ready();
+  }) });
+  const pending = [items(handler, [1]), items(handler, [2], "other-address")];
+  await started;
+  assert.deepEqual(await items(handler, [3]), [{ number: 3, status: "error" }]);
+  assert.equal(calls.length, 2);
+  for (const release of releases) release(new Response(null, { status: 500 }));
+  assert.ok((await Promise.all(pending)).every(([item]) => item.status === "error"));
+  assert.deepEqual(await items(handler, [4]), [{ number: 4, status: "error" }]);
+  assert.equal(calls.length, 2);
+  const zero = setup({ replyReadBudget: 0 });
+  assert.deepEqual(await items(zero.handler), [{ number: 37, status: "error" }]);
+  assert.equal(zero.calls.length, 0);
+  assert.equal((await zero.handler(request("", creation()), ADDRESS)).status, 201);
+  assert.equal((await zero.handler(write(), ADDRESS)).status, 201);
+});
+
+test("low numeric rate-limit watermarks block uncached replies but preserve cache hits and expire at reset", async () => {
+  let low = false;
+  let at = NOW;
+  const reset = (NOW + 120000) / 1000;
+  const { handler, calls } = setup({ now: () => at, fetch: (url, init, normal) => {
+    const response = normal(url, init);
+    if (low) {
+      response.headers.set("x-ratelimit-remaining", "999");
+      response.headers.set("x-ratelimit-reset", String(reset));
+    }
+    return response;
+  } });
+  assert.equal((await items(handler))[0].status, "ok");
+  low = true;
+  assert.equal((await handler(request("", creation()), ADDRESS)).status, 201);
+  assert.equal((await handler(write({ number: 40 }), ADDRESS)).status, 201);
+  const before = calls.length;
+  assert.equal((await items(handler))[0].status, "ok");
+  assert.equal((await items(handler, [38]))[0].status, "error");
+  assert.equal(calls.length, before);
+  at = reset * 1000 - 1;
+  assert.equal((await items(handler, [38]))[0].status, "error");
+  assert.equal(calls.length, before);
+  at++;
+  assert.equal((await items(handler, [38]))[0].status, "ok");
+  assert.equal(calls.length, before + 2);
+});
+
+test("watermark uses the latest numeric header, ignores malformed headers, and clears at 1000 remaining", async () => {
+  let headers = { "X-RateLimit-Remaining": "999", "X-RateLimit-Reset": String((NOW + HOUR) / 1000) };
+  const { handler, calls } = setup({ fetch: (url, init, normal) => {
+    const response = normal(url, init);
+    for (const [name, value] of Object.entries(headers)) response.headers.set(name, value);
+    return response;
+  } });
+  await expectError(await handler(write({ replyKey: WRONG_KEY }), ADDRESS), 403, "denied");
+  for (const value of [undefined, "", "not-numeric", "999garbage", "-1", "1.5", "Infinity", "9007199254740992"]) {
+    headers = value === undefined ? {} : { "X-RateLimit-Remaining": value };
+    await expectError(await handler(write({ replyKey: WRONG_KEY }), ADDRESS), 403, "denied");
+    const before = calls.length;
+    assert.deepEqual(await items(handler, [38]), [{ number: 38, status: "error" }]);
+    assert.equal(calls.length, before);
+  }
+  headers = { "X-RateLimit-Remaining": "1000", "X-RateLimit-Reset": String((NOW + HOUR) / 1000) };
+  await expectError(await handler(write({ replyKey: WRONG_KEY }), ADDRESS), 403, "denied");
+  assert.equal((await items(handler, [38]))[0].status, "ok");
+});
+
+test("every API response stage can update the watermark, including failures and revalidation 304s", async (t) => {
+  for (const stage of ["replies_issue", "replies_comments", "search_hour", "search_day", "create",
+    "supplement_issue", "supplement_comments", "supplement_create", "failure", "304"]) {
+    await t.test(stage, async () => {
+      let at = NOW;
+      let searches = 0;
+      const { handler, calls } = setup({ now: () => at, fetch: (url, init, normal) => {
+        const actual = url.includes("/search/issues") ? (searches++ % 2 ? "search_day" : "search_hour")
+          : url === API ? "create" : url.includes("/comments")
+            ? (init.method === "POST" ? "supplement_create" : stage.startsWith("replies_") ? "replies_comments" : "supplement_comments")
+            : stage.startsWith("replies_") ? "replies_issue" : "supplement_issue";
+        const response = stage === "failure" ? new Response(null, { status: 500 })
+          : stage === "304" && init.headers["If-None-Match"] ? new Response(null, { status: 304 }) : normal(url, init);
+        if (actual === stage || stage === "failure" || (stage === "304" && response.status === 304)) {
+          response.headers.set("X-RateLimit-Remaining", "999");
+          response.headers.set("X-RateLimit-Reset", String((NOW + HOUR) / 1000));
+        }
+        if (stage === "304") response.headers.set("etag", '"v1"');
+        return response;
+      } });
+      if (stage.startsWith("replies_") || stage === "304") {
+        await items(handler);
+        if (stage === "304") { at += 10 * 60000; await items(handler); }
+      } else if (stage.startsWith("search_") || stage === "create") {
+        assert.equal((await handler(request("", creation()), ADDRESS)).status, 201);
+      } else if (stage === "failure") await expectError(await handler(write(), ADDRESS), 502, "unavailable");
+      else assert.equal((await handler(write(), ADDRESS)).status, 201);
+      const before = calls.length;
+      assert.deepEqual(await items(handler, [38]), [{ number: 38, status: "error" }]);
+      assert.equal(calls.length, before);
+    });
+  }
+});
+
+test("a low watermark without a valid reset remains active until a numeric recovery is observed", async () => {
+  for (const reset of [undefined, "not-a-timestamp", "9007199254740992"]) {
+    const { handler, calls } = setup({ fetch: (url, init, normal) => {
+      const response = normal(url, init);
+      response.headers.set("X-RateLimit-Remaining", "999");
+      if (reset !== undefined) response.headers.set("X-RateLimit-Reset", reset);
+      return response;
+    } });
+    await expectError(await handler(write({ replyKey: WRONG_KEY }), ADDRESS), 403, "denied");
+    assert.deepEqual(await items(handler), [{ number: 37, status: "error" }]);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test("supplement attempts are reserved before authentication and failed attempts are retained", async () => {
+  let at = NOW;
+  const { handler, calls } = setup({ now: () => at });
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const input = write({ replyKey: WRONG_KEY });
+    input.headers.set("X-Forwarded-For", "fake-" + attempt);
+    await expectError(await handler(input, attempt % 2 ? ADDRESS : { remoteAddr: { hostname: ADDRESS } }), 403, "denied");
+    if (attempt === 14) at += HOUR / 2;
+  }
+  const blocked = await handler(write(), ADDRESS);
+  await expectError(blocked, 429, "rate_limited");
+  assert.equal(blocked.headers.get("retry-after"), "1800");
+  assert.equal(calls.length, 30);
+  at = NOW + HOUR - 1;
+  const almost = await handler(write(), ADDRESS);
+  await expectError(almost, 429, "rate_limited");
+  assert.equal(almost.headers.get("retry-after"), "1");
+  at++;
+  for (let attempt = 0; attempt < 15; attempt++) {
+    await expectError(await handler(write({ replyKey: WRONG_KEY }), ADDRESS), 403, "denied");
+  }
+  const stillFull = await handler(write(), ADDRESS);
+  await expectError(stillFull, 429, "rate_limited");
+  assert.equal(stillFull.headers.get("retry-after"), "1800");
+  assert.equal(calls.length, 45);
+  assert.equal((await handler(write(), "other-address")).status, 201);
+});
+
+test("network failures, definite write failures and duplicates never release supplement attempts", async () => {
+  for (const outcome of ["network", "http", "duplicate"]) {
+    const { handler, calls } = setup({
+      comments: outcome === "duplicate" ? [comment(1, { body: supplementMarker() })] : [],
+      fetch: (url, init, normal) => {
+        if (outcome === "network") throw new Error(TOKEN);
+        return outcome === "http" && init.method === "POST" ? new Response(null, { status: 422 }) : normal(url, init);
+      },
+    });
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const response = await handler(write(), ADDRESS);
+      if (outcome === "duplicate") assert.equal(response.status, 200);
+      else await expectError(response, 502, "unavailable");
+    }
+    const before = calls.length;
+    await expectError(await handler(write(), ADDRESS), 429, "rate_limited");
+    assert.equal(calls.length, before);
+    assert.equal(posts(calls).length, outcome === "http" ? 30 : 0);
+  }
+});
+
+test("concurrent supplements reserve attempts before queuing on the same issue", async () => {
+  let release;
+  let blocked;
+  let first = true;
+  const rejected = new Promise((resolve) => { blocked = resolve; });
+  const { handler, calls } = setup({ fetch: (url, init, normal) => {
+    if (!first) return normal(url, init);
+    first = false;
+    return new Promise((resolve) => { release = resolve; });
+  } });
+  const pending = Array.from({ length: 31 }, () => handler(write({ replyKey: WRONG_KEY }), ADDRESS).then((response) => {
+    if (response.status === 429) blocked(response);
+    return response;
+  }));
+  await expectError(await rejected, 429, "rate_limited");
+  assert.equal(calls.length, 1);
+  release(Response.json(issue()));
+  const responses = await Promise.all(pending);
+  assert.equal(responses.filter((response) => response.status === 403).length, 30);
+  assert.equal(calls.length, 30);
+});
+
+test("an open breaker returns replies 503 before reserving the per-address read quota", async () => {
+  let at = NOW;
+  let failing = true;
+  const { handler, calls } = setup({ now: () => at, fetch: (url, init, normal) => {
+    if (failing) return new Response("rate limited", { status: 403, headers: { "Retry-After": "120" } });
+    return normal(url, init);
+  } });
+  assert.deepEqual(await items(handler), [{ number: 37, status: "error" }]);
+  assert.equal(calls.length, 1);
+  const blocked = await handler(read(), ADDRESS);
+  await expectError(blocked, 503, "unavailable");
+  assert.equal(blocked.headers.get("retry-after"), "120");
+  assert.equal(calls.length, 1);
+  at += 120000;
+  failing = false;
+  for (let i = 0; i < 29; i++) assert.equal((await handler(read(), ADDRESS)).status, 200);
+  await expectError(await handler(read(), ADDRESS), 429, "rate_limited");
+});
+
 test("public reads work without a token and when disabled; supplements require enabled writes", async () => {
   for (const options of [{ token: undefined }, { token: " \r\n " }, { disabled: true }]) {
     const { handler, calls } = setup(options);
@@ -525,7 +799,9 @@ test("403 Retry-After opens a shared breaker for reads and writes, including cac
   failing = true;
   assert.deepEqual(await items(handler, [38]), [{ number: 38, status: "error" }]);
   const before = calls.length;
-  assert.deepEqual(await items(handler), [{ number: 37, status: "error" }]);
+  const blocked = await handler(read());
+  await expectError(blocked, 503, "unavailable");
+  assert.equal(blocked.headers.get("retry-after"), "120");
   for (const input of [write(), request("", creation())]) {
     const response = await handler(input, ADDRESS);
     await expectError(response, 503, "unavailable");
@@ -566,7 +842,9 @@ test("breaker handles 429, HTTP-date Retry-After and rate-reset, caps one hour, 
     assert.equal(response.headers.get("retry-after"), seconds ? String(seconds) : null);
     failing = false;
     if (seconds) {
-      assert.deepEqual(await items(handler), [{ number: 37, status: "error" }]);
+      const blocked = await handler(read());
+      await expectError(blocked, 503, "unavailable");
+      assert.equal(blocked.headers.get("retry-after"), String(seconds));
       assert.equal(calls.length, 1);
       at += seconds * 1000;
     }
@@ -585,7 +863,9 @@ test("breaker opens from searches and comment creation as well as issue and comm
     const response = await handler(stage === "search" || stage === "create" ? request("", creation()) : write(), ADDRESS);
     await expectError(response, 503, "unavailable");
     const count = calls.length;
-    assert.deepEqual(await items(handler), [{ number: 37, status: "error" }]);
+    const blocked = await handler(read());
+    await expectError(blocked, 503, "unavailable");
+    assert.equal(blocked.headers.get("retry-after"), "60");
     await expectError(await handler(write()), 503, "unavailable");
     assert.equal(calls.length, count);
   }

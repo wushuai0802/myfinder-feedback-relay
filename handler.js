@@ -800,7 +800,7 @@ export function createHandler({
         const failed = counts.find((count) => count.status === "rejected");
         if (failed) throw failed.reason;
         if (counts[0].value >= 10) return limited(3600);
-        if (counts[1].value >= 40) return limited(86400);
+        if (counts[1].value >= 100) return limited(86400);
 
         const content = issueContent(payload);
         if (payload.schema === 2) {

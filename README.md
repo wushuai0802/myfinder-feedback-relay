@@ -6,9 +6,10 @@
 
 - `GET /health`：200，`{"ok":true}`。仅表示服务可响应，不会检查令牌或访问 GitHub。
 - `POST /feedback`：使用 `Content-Type: application/json`（允许 `charset=utf-8`），请求体最多 **32768 字节**。声明的 `Content-Length` 和实际流式读取的字节数都会检查。
+- `GET /device-pack/v1/<文件名>`（也支持 `HEAD`）：只读型号数据包镜像，见下文。
 - 其他路径返回 404；已知路径不支持的方法返回 405。服务不提供 CORS 头，面向桌面程序调用。
 
-请求字段必须恰好如下，不能缺少或添加字段：
+反馈请求字段必须恰好如下，不能缺少或添加字段：
 
 ```json
 {
@@ -38,7 +39,17 @@
 | 413 | `too_large` | 声明或实际请求体超过字节上限 |
 | 429 | `rate_limited` | 达到限流阈值，响应有以秒为单位的 `Retry-After` |
 | 503 | `disabled` | 未配置令牌，或已停用提交 |
-| 502 | `unavailable` | GitHub 搜索或创建失败、响应异常或超时 |
+| 502 | `unavailable` | GitHub 搜索、创建或型号包下载失败、响应异常或超时 |
+
+## 型号数据包只读镜像
+
+`GET /device-pack/v1/<文件名>` 和 `HEAD /device-pack/v1/<文件名>` 仅接受完全匹配 `^device-pack-v1-(latest|[1-9][0-9]{0,9})\.json(\.sig)?$` 的文件名，且 `latest` 不允许带 `.sig`。例如 `device-pack-v1-latest.json`、`device-pack-v1-1.json`、`device-pack-v1-1.json.sig`。其他名称一律 404，不对路径中的编码字符做二次解码；合法名称的其他方法返回 405。HEAD 与 GET 执行相同的下载校验和缓存流程，但响应没有正文（包括错误响应）。
+
+上游固定为 `https://github.com/wushuai0802/myfinder-device-battery/releases/download/device-pack/<文件名>`，不受 `FEEDBACK_REPO` 影响。传入的查询参数被忽略，不转发请求头、Authorization、Cookie 或令牌；`If-None-Match` 只在本地比较。下载使用 `redirect: "follow"`，最终 URL 必须为 HTTPS，主机仅允许 `github.com`、`objects.githubusercontent.com`、`release-assets.githubusercontent.com`，不允许非默认端口。每次下载（含读取正文）限时 10 秒；latest 和签名各限 4096 字节，版本数据包限 262144 字节，同时检查声明长度和实际读取字节数。上游 404 返回 404，其他失败、非法跳转、超时或超限均返回 502，不缓存失败结果。镜像独立于反馈令牌及 `FEEDBACK_DISABLED`，不创建 issue。
+
+JSON 响应使用 `Content-Type: application/json`，签名使用 `text/plain`，并设置 `X-Content-Type-Options: nosniff`，不添加 CORS 头。latest 的 `Cache-Control` 为 `public, max-age=300`，带版本号的 JSON 和签名为 `public, max-age=86400, immutable`。进程内缓存采用相同有效期，最多 64 个文件，超过时淘汰最早存入的文件，读取不会延长有效期或改变淘汰顺序。成功响应保留上游 `ETag`，匹配的 `If-None-Match` 返回无正文的 304（支持弱标签、标签列表及 `*`）；过期后先重新下载再比较。
+
+镜像单独按地址的 SHA-256 哈希限流：滑动一分钟内最多 60 次合法 GET/HEAD，包括缓存命中、304 和下载失败；超限返回带 `Retry-After` 的 429。使用与反馈相同的可信地址来源，不读取转发头；缺少地址时共用未知桶，地址表最多 10000 项，过期后回收。缓存和限流均只属于当前进程，重启清空，多实例不共享。镜像只传递文件字节，**客户端仍须使用内置公钥校验型号数据包签名**。
 
 ## 限流、文字处理与隐私
 
@@ -54,7 +65,7 @@
 
 **反馈会公开显示在 GitHub。** 请勿提交密码、令牌、个人身份信息等敏感内容；发送前检查描述和诊断。服务不持久化保存反馈内容，只在处理请求时转发；仅在内存中短期保存地址的 SHA-256 哈希、成功时间和处理中计数用于限流，不保存原始地址，不记录请求内容、地址或令牌。哈希不是完全匿名化；GitHub 和部署平台可能另有自己的数据保留策略。
 
-每次返回 502 时，服务只记录一行 `relay_error stage=create status=403 kind=http` 形式的日志：阶段为 `search_hour`、`search_day`、`create` 或 `unexpected`，状态码为 GitHub HTTP 状态码（未收到则为 `0`），类型为 `timeout`、`network`、`http`、`bad_body` 或 `unexpected`。日志不含请求头、请求体、用户文字、地址、令牌、GitHub 正文或异常消息；其他响应不记录日志。
+每次返回 502 时，服务只记录一行 `relay_error stage=create status=403 kind=http` 形式的日志：阶段为 `search_hour`、`search_day`、`create`、`device_pack` 或 `unexpected`，状态码为 GitHub HTTP 状态码（未收到则为 `0`），类型为 `timeout`、`network`、`http`、`bad_body`、`redirect`、`too_large` 或 `unexpected`。日志不含请求头、请求体、用户文字、地址、令牌、GitHub 正文或异常消息；其他响应不记录日志。
 
 ## 部署步骤（Deno Deploy）
 

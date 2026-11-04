@@ -4,6 +4,14 @@ const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 const MAX_ADDRESSES = 10000;
 const GITHUB_TIMEOUT = 10000;
+const MINUTE = 60 * 1000;
+const DEVICE_PACK_PREFIX = "/device-pack/v1/";
+const DEVICE_PACK_UPSTREAM = "https://github.com/wushuai0802/myfinder-device-battery/releases/download/device-pack/";
+const DEVICE_PACK_HOSTS = new Set([
+  "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+]);
+const DEVICE_PACK_NAME = /^device-pack-v1-(latest|[1-9][0-9]{0,9})\.json(\.sig)?$/;
+const MAX_DEVICE_PACK_FILES = 64;
 const CATEGORIES = Object.freeze({
   device: "设备不识别",
   battery: "电量或 DPI 不对",
@@ -139,6 +147,157 @@ async function hashAddress(info) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function devicePackResponse(response, method) {
+  response.headers.set("X-Content-Type-Options", "nosniff");
+  return method === "HEAD"
+    ? new Response(null, { status: response.status, headers: response.headers }) : response;
+}
+
+function matchesETag(condition, etag) {
+  if (condition?.trim() === "*") return true;
+  if (!condition || !etag) return false;
+  // GET/HEAD use weak comparison; quoted tags may themselves contain commas.
+  return Array.from(condition.matchAll(/(?:W\/)?"[\x21\x23-\x7e\x80-\xff]*"/g))
+    .some(([tag]) => tag.replace(/^W\//, "") === etag.replace(/^W\//, ""));
+}
+
+function createDevicePackMirror(fetchImpl, now) {
+  const cache = new Map();
+  const addresses = new Map();
+
+  function reserve(key, at) {
+    for (const [storedKey, times] of addresses) {
+      while (times.length && times[0] <= at - MINUTE) times.shift();
+      if (!times.length) addresses.delete(storedKey);
+    }
+    let times = addresses.get(key);
+    if (!times) {
+      if (addresses.size >= MAX_ADDRESSES) return 60;
+      times = [];
+      addresses.set(key, times);
+    }
+    if (times.length >= 60) return Math.max(1, Math.ceil((times[0] + MINUTE - at) / 1000));
+    times.push(at);
+    return 0;
+  }
+
+  async function download(filename, limit) {
+    const controller = new AbortController();
+    let timeout;
+    let response;
+    let reader;
+    let status = 0;
+    try {
+      return await Promise.race([
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => {
+            reject(new RelayError("device_pack", status, "timeout"));
+            controller.abort();
+            if (reader) void reader.cancel().catch(() => {});
+          }, GITHUB_TIMEOUT);
+        }),
+        (async () => {
+          try {
+            // Never use the authenticated feedback client or any incoming headers.
+            response = await fetchImpl(DEVICE_PACK_UPSTREAM + filename, {
+              method: "GET", redirect: "follow", credentials: "omit", signal: controller.signal,
+            });
+          } catch {
+            throw new RelayError("device_pack", 0, "network");
+          }
+          if (controller.signal.aborted) {
+            // A fetch implementation can settle after the deadline despite abort.
+            if (response.body) void response.body.cancel().catch(() => {});
+            throw new RelayError("device_pack", 0, "timeout");
+          }
+          status = response.status;
+          let finalURL;
+          try { finalURL = new URL(response.url); } catch { /* Fail closed below. */ }
+          if (!finalURL || finalURL.protocol !== "https:" || !DEVICE_PACK_HOSTS.has(finalURL.host)) {
+            throw new RelayError("device_pack", status, "redirect");
+          }
+          if (status === 404) return null;
+          if (status !== 200) throw new RelayError("device_pack", status, "http");
+          const length = response.headers.get("content-length");
+          if (length !== null && Number(length) > limit) {
+            throw new RelayError("device_pack", status, "too_large");
+          }
+          const chunks = [];
+          let size = 0;
+          try {
+            reader = response.body?.getReader();
+            while (reader) {
+              const { done, value } = await reader.read();
+              controller.signal.throwIfAborted();
+              if (done) break;
+              size += value.byteLength;
+              if (size > limit) throw new RelayError("device_pack", status, "too_large");
+              chunks.push(value);
+            }
+          } catch (failure) {
+            throw failure instanceof RelayError ? failure : new RelayError("device_pack", status, "bad_body");
+          }
+          const bytes = new Uint8Array(size);
+          let offset = 0;
+          for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
+          return { bytes, etag: response.headers.get("etag") };
+        })(),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+      // Never wait for an upstream cancellation callback to finish.
+      if (reader) {
+        void reader.cancel().catch(() => {});
+        reader.releaseLock();
+      } else if (response?.body) {
+        void response.body.cancel().catch(() => {});
+      }
+    }
+  }
+
+  return async (request, info, filename) => {
+    const match = DEVICE_PACK_NAME.exec(filename);
+    if (!match || match[0] !== filename || (match[1] === "latest" && match[2])) {
+      return error(404, "invalid");
+    }
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return error(405, "invalid", { Allow: "GET, HEAD" });
+    }
+    const key = await hashAddress(info);
+    const at = now();
+    const retry = reserve(key, at);
+    if (retry) return limited(retry);
+
+    const latest = match[1] === "latest";
+    const signature = Boolean(match[2]);
+    const ttl = latest ? 5 * MINUTE : DAY;
+    for (const [name, entry] of cache) {
+      if (entry.expires <= at) cache.delete(name);
+    }
+    let entry = cache.get(filename);
+    if (!entry) {
+      const downloaded = await download(filename, latest || signature ? 4096 : 256 * 1024);
+      if (!downloaded) return error(404, "invalid");
+      entry = { ...downloaded, expires: now() + ttl };
+      cache.delete(filename);
+      cache.set(filename, entry);
+      if (cache.size > MAX_DEVICE_PACK_FILES) cache.delete(cache.keys().next().value);
+    }
+    const headers = {
+      "Content-Type": signature ? "text/plain" : "application/json",
+      "Cache-Control": latest ? "public, max-age=300" : "public, max-age=86400, immutable",
+      ...(entry.etag === null ? {} : { ETag: entry.etag }),
+    };
+    if (matchesETag(request.headers.get("if-none-match"), entry.etag)) {
+      return new Response(null, { status: 304, headers });
+    }
+    return new Response(request.method === "HEAD" ? null : entry.bytes, { headers });
+  };
+}
+
 /**
  * Portable Fetch handler. info may be a hostname string or Deno's serve info.
  * Missing addresses share one bucket; forwarded headers are never trusted.
@@ -152,6 +311,7 @@ export function createHandler({
   log = console.error,
 } = {}) {
   if (typeof token === "string") token = token.trim();
+  const devicePack = createDevicePackMirror(fetchImpl, now);
   // Only SHA-256 keys, success timestamps and pending counts survive a request.
   const addresses = new Map();
 
@@ -231,8 +391,14 @@ export function createHandler({
   }
 
   return async (request, info) => {
+    let isDevicePack = false;
     try {
       const path = new URL(request.url).pathname;
+      if (path.startsWith(DEVICE_PACK_PREFIX)) {
+        isDevicePack = true;
+        // pathname stays encoded: never decode or reinterpret the filename.
+        return devicePackResponse(await devicePack(request, info, path.slice(DEVICE_PACK_PREFIX.length)), request.method);
+      }
       if (path === "/health") {
         return request.method === "GET" ? json(200, { ok: true }) : error(405, "invalid", { Allow: "GET" });
       }
@@ -279,7 +445,8 @@ export function createHandler({
       } catch {
         // A failing logger must not change the response or trigger a second log.
       }
-      return error(502, "unavailable");
+      const response = error(502, "unavailable");
+      return isDevicePack ? devicePackResponse(response, request.method) : response;
     }
   };
 }

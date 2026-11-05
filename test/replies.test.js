@@ -204,8 +204,8 @@ test("supplement gates missing, PR, unlabeled, closed, locked and 100-comment is
   assert.equal(calls.length, 1);
 });
 
-test("3/24h counts distinct marked maintainer comments only, and duplicate replay precedes that limit", async () => {
-  const marked = [1, 2, 3].map((id) => comment(id, { body: supplementMarker(id === 1 ? REQUEST_ID : String(id)),
+test("6/24h counts distinct marked maintainer comments only, and duplicate replay precedes that limit", async () => {
+  const marked = [1, 2, 3, 4, 5, 6].map((id) => comment(id, { body: supplementMarker(id === 1 ? REQUEST_ID : String(id)),
     created_at: new Date(NOW - HOUR).toISOString() }));
   const blocked = setup({ comments: marked });
   const response = await blocked.handler(write({ requestId: REQUEST_ID.replace("abc", "abd") }), ADDRESS);
@@ -213,10 +213,10 @@ test("3/24h counts distinct marked maintainer comments only, and duplicate repla
   assert.equal(response.headers.get("retry-after"), String(23 * 3600));
   assert.equal((await blocked.handler(write(), ADDRESS)).status, 200);
   assert.equal(posts(blocked.calls).length, 0);
-  const allowed = setup({ comments: [marked[0], marked[1],
-    comment(4, { body: supplementMarker("old"), created_at: new Date(NOW - DAY).toISOString() }),
-    comment(5, { body: supplementMarker(), user: { id: BOT } }),
-    comment(6, { body: supplementMarker(), user: { id: 999 } }), comment(7)] });
+  const allowed = setup({ comments: [...marked.slice(0, 5),
+    comment(14, { body: supplementMarker("old"), created_at: new Date(NOW - DAY).toISOString() }),
+    comment(15, { body: supplementMarker(), user: { id: BOT } }),
+    comment(16, { body: supplementMarker(), user: { id: 999 } }), comment(17)] });
   assert.equal((await allowed.handler(write({ requestId: REQUEST_ID.replace("abc", "abd") }), ADDRESS)).status, 201);
 });
 

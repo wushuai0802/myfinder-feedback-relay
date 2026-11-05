@@ -471,7 +471,7 @@ test("address table caps at 10000, permits existing addresses, then reclaims exp
 });
 
 test("both global thresholds are enforced before creating an issue", async (t) => {
-  for (const [hour, day, status, retry] of [[9, 99, 201], [10, 10, 429, "3600"], [11, 99, 429, "3600"], [0, 100, 429, "86400"], [9, 101, 429, "86400"]]) {
+  for (const [hour, day, status, retry] of [[19, 199, 201], [20, 20, 429, "3600"], [21, 199, 429, "3600"], [0, 200, 429, "86400"], [19, 201, 429, "86400"]]) {
     await t.test("counts " + hour + "/" + day, async () => {
       const github = fakeGithub({ hour, day });
       const { handler, logs } = setup({ fetch: github.fetch });

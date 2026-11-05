@@ -732,7 +732,7 @@ export function createHandler({
         const time = commentTime(comment.created_at, "supplement_comments");
         if (time > at - DAY) recent.set(commentId(comment, "supplement_comments"), time);
       }
-      if (recent.size >= 3) return limited(Math.max(1, Math.ceil((Math.min(...recent.values()) + DAY - at) / 1000)));
+      if (recent.size >= 6) return limited(Math.max(1, Math.ceil((Math.min(...recent.values()) + DAY - at) / 1000)));
       const address = reserveSupplementAddress(key, now());
       if (address.retry) return limited(address.retry);
       const global = reserveSupplementGlobal("global", now());
@@ -799,8 +799,8 @@ export function createHandler({
         // Prefer the hour search when both fail, regardless of completion order.
         const failed = counts.find((count) => count.status === "rejected");
         if (failed) throw failed.reason;
-        if (counts[0].value >= 10) return limited(3600);
-        if (counts[1].value >= 100) return limited(86400);
+        if (counts[0].value >= 20) return limited(3600);
+        if (counts[1].value >= 200) return limited(86400);
 
         const content = issueContent(payload);
         if (payload.schema === 2) {

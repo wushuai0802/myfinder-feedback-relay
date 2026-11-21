@@ -1,0 +1,5 @@
+name = "myfinder-feedback-relay"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+# The GitHub token is a secret: run `npx wrangler secret put FEEDBACK_GITHUB_TOKEN` yourself.
+# Never put it in this file.

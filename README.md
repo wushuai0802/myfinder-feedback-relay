@@ -169,3 +169,14 @@ GitHub 是唯一持久存储，不增加数据库或服务端 secret。服务只
 安装 Node 24 后，在项目目录运行 `npm test`（或 `node --test`）。无依赖，测试全部使用假的 fetch，不访问 GitHub。导入 `main.js` 不会在 Node 下启动服务。
 
 `handler.js` 导出 `createHandler({ token, repo, fetch, now, disabled, log, maintainerId, triageBotId, replyReadBudget })`，其中 `repo` 默认上述仓库、`fetch` 默认全局 fetch、`now` 默认 `Date.now`、`log` 默认 `console.error`，两个数字身份默认分别为 `50058348` 和 `41898282`，`replyReadBudget` 默认 `1200`（设为 `0` 时仅允许缓存回复），可在构造时覆盖（例如测试或移植到其他仓库）。入口读取令牌和 handler 接收令牌时都会去除首尾空白。返回的异步函数接收标准 `Request` 和客户端 hostname 字符串（也支持 Deno 的 `{ remoteAddr: { hostname } }`），返回标准 `Response`。其他 Fetch 运行时可自行适配可信地址来源；应保证 Web Crypto、atob、AbortController 和流式 Fetch API 可用。
+
+## Cloudflare Workers 部署
+
+Worker 入口读取 Cloudflare Secret 并调用同一份请求处理器，供客户端作为中转地址。部署从此仓库中包含 wrangler 配置的目录执行。
+
+1. 在终端运行 npx wrangler login，在浏览器登录自己的 Cloudflare 账号。
+2. 在终端运行 npx wrangler secret put FEEDBACK_GITHUB_TOKEN，将 GitHub 令牌直接输入 Secret 提示。
+3. 运行 npx wrangler deploy，记录输出的 workers.dev 地址。
+4. 访问该地址的 /health，预期返回 200 和 {"ok":true}。该路径用于确认 Worker 可达。
+
+Deno 和 Cloudflare 使用各自的额度。/health 能回读即可核对部署与路由，反馈及回复还需按对应接口的验证流程检查。
